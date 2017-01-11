@@ -62,13 +62,37 @@ def read_header(filename):
     return m.end(), config
 
 
+def read_files(filenames, dtype, chunks, slice_size):
+    for filename in filenames:
+        print('Processing {}'.format(filename))
+        offset, config = read_header(filename)
+        with open(filename, 'rb') as fh:
+            if offset is not None:
+                fh.seek(offset)
+
+            while True:
+                data = fh.read(chunks)
+                if not len(data):
+                    break
+
+                assert not (len(data) % slice_size)
+                yield np.frombuffer(data, dtype=dtype)
+
+
 def create_nix_file(
     file_pat, output=None, signed=False, rate=1, electrode_scale=0.0104,
-    analog_scale=12.5122, channels=channels):
+    analog_scale=12.5122, channels=channels, chunks=256 * 1024 * 1024):
     '''The default resolution (i.e. voltage per bit) in uV '''
     filenames = sorted(glob(file_pat))
 
     dtype = np.int16 if signed else np.uint16
+    N = len(channels)
+    slice_size = N * 2
+    chunks = chunks - chunks % slice_size  # round to equal blocks
+
+    reader = read_files(filenames, dtype, chunks, slice_size)
+    data = next(reader)
+
     if signed:
         af = lambda x: x.astype(np.float32) * analog_scale
         ef = lambda x: x.astype(np.float32) * electrode_scale
@@ -84,66 +108,38 @@ def create_nix_file(
         (i, ch) for i, ch in enumerate(channels) if not ch.startswith('D') and
         not ch.startswith('A')]
 
+    groups = (('Analog', analogs, af, np.float32),
+              ('Digital', digitals, df, np.bool_),
+              ('Electrodes', electrodes, ef, np.float32))
+
     if output is None:
         output = '{}.h5'.format(splitext(filenames[0])[0])
     ofile = NixIO(output, mode='ow')
 
     blk = Block()
-    for group_i, (channels, name, ctype) in enumerate((
-        (analogs, 'Analog', np.float32), (digitals, 'Digital', np.bool_),
-        (electrodes, 'Electrodes', np.float32))):
-        seg = Segment(name=name)
-        for _, chan_name in channels:
+    for group_name, channels, f, dtype in groups:
+        seg = Segment(name=group_name)
+        for slice_idx, chan_name in channels:
             seg.analogsignals.append(AnalogSignal(
-                np.array([], dtype=ctype), dtype=ctype, units=uV,
+                f(data[slice_idx::N]), dtype=dtype, units=uV,
                 sampling_rate=rate * Hz, name=chan_name))
         blk.segments.append(seg)
 
     ofile.write_block(blk)
-    ofile.nix_file.close()
-    return (output,
-            {'Analog': (analogs, af), 'Digital': (digitals, df),
-             'Electrodes': (electrodes, ef)},
-            filenames, dtype)
+    nix_file = ofile.nix_file
+    nix_groups = nix_file.blocks[0].groups
 
+    for data in reader:
+        for group_name, channels, f, _ in groups:
+            data_arrays = nix_groups[group_name].data_arrays
+            for i, (slice_idx, _) in enumerate(channels):
+                # nix_file._h5file.flush()
+                data_arrays[i].append(f(data[slice_idx::N]))
 
-def populate_file(filename, channels, filenames, dtype,
-                  chunks=256 * 1024 * 1024):
-    nix_file = nix.File.open(filename, nix.FileMode.ReadWrite)
-
-    channel_paths = []
-    for group_name, (chans, f) in channels.items():
-        group = nix_file.blocks[0].groups[group_name]
-        for chan, (slice_idx, chan_name) in enumerate(chans):
-            dataset = group.data_arrays[chan]
-            assert dataset.metadata.name == chan_name
-            channel_paths.append((dataset, slice_idx, f))
-
-    N = len(channel_paths)
-    slice_size = N * 2
-    chunks = chunks - chunks % slice_size  # round to equal blocks
-
-    for filename in filenames:
-        print('Processing {}'.format(filename))
-        offset, config = read_header(filename)
-        with open(filename, 'rb') as fh:
-            if offset is not None:
-                fh.seek(offset)
-
-            while True:
-                data = fh.read(chunks)
-                if not len(data):
-                    break
-
-                assert not (len(data) % slice_size)
-                arr = np.frombuffer(data, dtype=dtype)
-                for dataset, i, f in channel_paths:
-                    dataset.append(f(arr[i::N]))
     nix_file.close()
-    return filename
+    return output
 
 if __name__ == '__main__':
-    fname = r'V:\Matt E\nix\slice1_0000.raw'
-    fname_pat = r'V:\Matt E\nix\slice1_0000.raw'
-    res = create_nix_file(fname_pat, **read_header(fname)[1])
-    populate_file(*res)
+    fname = r'g:\slice1_0000.raw'
+    fname_pat = r'g:\slice1_0000.raw'
+    print(create_nix_file(fname_pat, **read_header(fname)[1]))
