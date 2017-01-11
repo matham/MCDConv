@@ -5,13 +5,14 @@ from distutils.version import StrictVersion
 from re import compile, match, sub
 import numpy as np
 
-from neo.io.hdf5io import NeoHdf5IO
+import nixio as nix
+from neo.io.nixio import NixIO
 from neo.core import (
-    Block, RecordingChannelGroup,  RecordingChannel, AnalogSignal)
+    Block, ChannelIndex, AnalogSignal, Segment)
 from quantities import uV, Hz
 
 mcd_version_min = StrictVersion('2.6.0')
-mcd_version_max = StrictVersion('2.6.0')
+mcd_version_max = StrictVersion('2.6.15')
 header_pat = compile(br'MC_DataTool binary conversion\r\n'
 br'Version ([0-9\.]+)\r\n'
 br'MC_REC file = .+\r\n'
@@ -61,14 +62,12 @@ def read_header(filename):
     return m.end(), config
 
 
-
-def convert_raw_files(
-    file_pat, output=None, chunks=256 * 1024 * 1024, signed=False,
-    rate=1, electrode_scale=0.0104, analog_scale=12.5122, channels=channels):
+def create_nix_file(
+    file_pat, output=None, signed=False, rate=1, electrode_scale=0.0104,
+    analog_scale=12.5122, channels=channels):
     '''The default resolution (i.e. voltage per bit) in uV '''
     filenames = sorted(glob(file_pat))
 
-    N = len(channels)
     dtype = np.int16 if signed else np.uint16
     if signed:
         af = lambda x: x.astype(np.float32) * analog_scale
@@ -84,40 +83,45 @@ def convert_raw_files(
     electrodes = [
         (i, ch) for i, ch in enumerate(channels) if not ch.startswith('D') and
         not ch.startswith('A')]
-    slice_size = len(channels) * 2
-    chunks = chunks - chunks % slice_size  # round to equal blocks
 
     if output is None:
         output = '{}.h5'.format(splitext(filenames[0])[0])
-    ofile = NeoHdf5IO(output, array_dtype=None)
+    ofile = NixIO(output, mode='ow')
 
     blk = Block()
-    for channels, name, ctype in (
+    for group_i, (channels, name, ctype) in enumerate((
         (analogs, 'Analog', np.float32), (digitals, 'Digital', np.bool_),
-        (electrodes, 'Electrodes', np.float32)):
-        group = RecordingChannelGroup(
-            name=name, channel_indexes=np.array([v[0] for v in channels]),
-            channel_names=np.array([v[1] for v in channels]))
-        for i, name in channels:
-            chan = RecordingChannel(index=i)
-            group.recordingchannels.append(chan)
-            chan.recordingchannelgroups.append(group)
-            chan.analogsignals.append(AnalogSignal(
+        (electrodes, 'Electrodes', np.float32))):
+        seg = Segment(name=name)
+        for _, chan_name in channels:
+            seg.analogsignals.append(AnalogSignal(
                 np.array([], dtype=ctype), dtype=ctype, units=uV,
-                sampling_rate=rate * Hz, name=name))
-        blk.recordingchannelgroups.append(group)
+                sampling_rate=rate * Hz, name=chan_name))
+        blk.segments.append(seg)
 
     ofile.write_block(blk)
-    hdf_groups = ofile._data.root.Block_0.recordingchannelgroups
+    ofile.nix_file.close()
+    return (output,
+            {'Analog': (analogs, af), 'Digital': (digitals, df),
+             'Electrodes': (electrodes, ef)},
+            filenames, dtype)
+
+
+def populate_file(filename, channels, filenames, dtype,
+                  chunks=256 * 1024 * 1024):
+    nix_file = nix.File.open(filename, nix.FileMode.ReadWrite)
+
     channel_paths = []
-    for i, (channels, f) in enumerate(
-        ((analogs, af), (digitals, df), (electrodes, ef))):
-        hdf_channs = getattr(
-            hdf_groups, 'RecordingChannelGroup_{}'.format(i)).recordingchannels
-        for j, (slice_idx, _) in enumerate(channels):
-            channel_paths.append((
-                getattr(hdf_channs, 'RecordingChannel_{}'.format(j)
-                        ).analogsignals.AnalogSignal_0.signal, slice_idx, f))
+    for group_name, (chans, f) in channels.items():
+        group = nix_file.blocks[0].groups[group_name]
+        for chan, (slice_idx, chan_name) in enumerate(chans):
+            dataset = group.data_arrays[chan]
+            assert dataset.metadata.name == chan_name
+            channel_paths.append((dataset, slice_idx, f))
+
+    N = len(channel_paths)
+    slice_size = N * 2
+    chunks = chunks - chunks % slice_size  # round to equal blocks
 
     for filename in filenames:
         print('Processing {}'.format(filename))
@@ -130,18 +134,16 @@ def convert_raw_files(
                 data = fh.read(chunks)
                 if not len(data):
                     break
+
                 assert not (len(data) % slice_size)
-                arr = np.fromstring(data, dtype=dtype)
-                for signal, i, f in channel_paths:
-                    x = f(arr[i::N])
-                    x.resize((len(x), 1))
-                    signal.append(x)
-    ofile.close()
-    return output
+                arr = np.frombuffer(data, dtype=dtype)
+                for dataset, i, f in channel_paths:
+                    dataset.append(f(arr[i::N]))
+    nix_file.close()
+    return filename
 
 if __name__ == '__main__':
-    fname = r'F:\MattE\all_file_header_test.raw'
-    fname_pat = r'F:\MattE\all_file_header_test*.raw'
-    convert_raw_files(fname_pat, **read_header(fname)[1])
-    fname_pat = r'F:\MattE\all_file_test*.raw'
-    convert_raw_files(fname_pat)
+    fname = r'V:\Matt E\nix\slice1_0000.raw'
+    fname_pat = r'V:\Matt E\nix\slice1_0000.raw'
+    res = create_nix_file(fname_pat, **read_header(fname)[1])
+    populate_file(*res)
