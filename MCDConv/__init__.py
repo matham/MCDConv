@@ -130,8 +130,8 @@ def create_nix_file(
     nix_groups = nix_file.blocks[0].groups
 
     for data in reader:
-        for group_name, channels, f, _ in groups:
-            data_arrays = nix_groups[group_name].data_arrays
+        for k, (group_name, channels, f, _) in enumerate(groups):
+            data_arrays = nix_groups[k].data_arrays
             for i, (slice_idx, _) in enumerate(channels):
                 # nix_file._h5file.flush()
                 data_arrays[i].append(f(data[slice_idx::N]))
