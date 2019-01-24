@@ -4,6 +4,9 @@ from os.path import splitext
 from distutils.version import StrictVersion
 from re import compile, match, sub
 import numpy as np
+from numpy.lib.format import open_memmap
+from tqdm import tqdm
+import sys
 
 import nixio as nix
 from neo.io.nixio import NixIO
@@ -138,6 +141,42 @@ def create_nix_file(
 
     nix_file.close()
     return output
+
+
+def dump_electrode_data_circus(in_filename, out_filename, chunks=1e9):
+    in_file = NixIO(in_filename)
+    block = in_file.read_all_blocks()[0]
+    signals = block.segments[2].analogsignals
+    names = [signal.annotations['nix_name'] for signal in signals]
+
+    indices = sorted(range(len(signals)), key=lambda x: names[x])
+    signals = [signals[i] for i in indices]
+    names = [names[i] for i in indices]
+
+    itemsize = np.array([0.0], dtype=np.float32).nbytes
+
+    n = len(signals[0])  # num samples per channel
+    n_items = int(chunks // itemsize)  # num chunked samples per chan
+    total_n = sum(len(value) for value in signals)  # num samples total
+    pbar = tqdm(
+        total=total_n * itemsize, file=sys.stdout, unit_scale=1, unit='bytes')
+
+    mmap_array = open_memmap(
+        out_filename, mode='w+', dtype=np.float32, shape=(n, len(signals)))
+
+    for k, signal in enumerate(signals):
+        i = 0
+        n = len(signal)
+
+        while i * n_items < n:
+            items = np.array(
+                signal[i * n_items:min((i + 1) * n_items, n)],
+                dtype=np.float32)[:, 0]
+            mmap_array[i * n_items:i * n_items + len(items), k] = items
+            pbar.update(len(items) * itemsize)
+            i += 1
+    pbar.close()
+    print('Channel order is: {}'.format(names))
 
 if __name__ == '__main__':
     fname = r'g:\slice1_0000.raw'
